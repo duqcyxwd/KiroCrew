@@ -1919,7 +1919,9 @@ versions is what lets a v2 instance still receive a copy from a v1 one.
 |---|---|
 | `POST /api/instances/{id}/send-session` | Sending side. Body `{"slot": "<local slot key>"}`. Bundles the local session and delivers it over that instance's open tunnel. |
 | `GET /api/chat/slots/{slot}/export` | Sending side, file hop. Streams the SAME bundle as a gzipped download instead of over a tunnel — see §14.7. `?format=md` streams it as a human-readable Markdown transcript instead; see §14.7a. |
-| `POST /api/chat/slots/import` | Receiving side, for BOTH arrival routes. Accepts a bundle — gzipped or plain JSON, sniffed from its own bytes — and materialises a new slot. See §14.5a. |
+| `POST /api/chat/slots/import` | Receiving side, for BOTH wire arrival routes. Accepts a bundle — gzipped or plain JSON, sniffed from its own bytes — and materialises a new slot. See §14.5a. |
+| `GET /api/kiro-cli-sessions` | Local only. Lists the kiro-cli session store so the user can pick one to adopt. See §14.9. |
+| `POST /api/chat/slots/import-kiro-cli` | Local only. Converts the picked kiro-cli session to a bundle and materialises it through the shared arrival path. See §14.9. |
 
 `send-session` goes through the same `_guard()` as every other route in §6
 (owner-only, never Slack, feature-gated, SEL-audited as
@@ -1986,11 +1988,22 @@ re-reads, so:
 
 ### 14.5a Arrival: one route, one set of rules
 
-`POST /api/chat/slots/import` is the **only** server route behind both ways a
-session can arrive — a peer's `send_session_bundle` pushing over the tunnel, and
-a person importing an exported file from `ImportSessionItem`. So everything
-that must hold for "a session arrived here" is written in `api_chat_slot_import`
-and nowhere else. Two rules live there.
+`POST /api/chat/slots/import` is the server route behind the two ways a session
+arrives *over a byte stream* — a peer's `send_session_bundle` pushing over the
+tunnel, and a person importing an exported file from `ImportSessionItem`. The
+two rules below (gzip-or-plain sniffing, stream-to-disk) are properties of a
+body that came off a socket, so they live in `api_chat_slot_import` and nowhere
+else.
+
+What must hold for a session *once it is a validated bundle*, by contrast, is
+`_materialise_validated_bundle` — folder attribution, the agent/model resolution,
+and the `_materialise_slot_from_history` write. Both wire arrivals reach it after
+reading and validating their body, and the local kiro-cli adopt (§14.9) reaches
+it after converting a replay log, so "one route, one set of rules" is a property
+of that one function rather than of a convention each arrival has to keep. The
+slot-cap refusal is likewise one shared helper (`_slot_cap_refusal`), applied by
+every arrival at the first moment it can be — a wire bundle before its body is
+streamed to disk, a local adopt before it converts a log.
 
 **The body is gzip or plain JSON, decided by its own first two bytes.** Not by
 `Content-Type`: `GET .../export` answers `application/gzip`, a browser uploading
@@ -2637,6 +2650,46 @@ to report. Absence therefore means "not known" while `""` means "interactive",
 and the two are kept distinguishable on purpose: collapsing them would make the
 field's only interesting reading, that a transcript was produced under
 auto-approval, indistinguishable from a gateway with nothing to say.
+
+### 14.9 Adopting a kiro-cli session (local, no transport)
+
+A third way a session arrives is **local**: kiro-cli keeps its own store
+(`<kiro home>/sessions/cli/<sid>.json` + `<sid>.jsonl`), and most of what lives
+there has no Kiro Crew transcript at all — a subagent run leaves only a replay
+log, and a plain `kiro-cli chat` conversation predates the dashboard. Adopt lets
+the user pick one of those and open it as a dashboard chat.
+
+Two endpoints, both owner-only and SEL-audited
+(`kiro_cli_sessions.list` / `kiro_cli_sessions.adopt`), implemented in
+`dashboard/kiro_cli_adopt.py` over the read-only browser in
+`kiro_cli_sessions.py`:
+
+- **`GET /api/kiro-cli-sessions`** enumerates the store (envelope + replay-log
+  bytes per sid), newest first, with optional `q` (substring over title/cwd),
+  `kind` (`cli` / `subagent` / `rewind`) and `resumable` filters. The scan is
+  cached briefly (`_SCAN_CACHE_TTL`) and keyed on the store path, because
+  parsing ~1600 envelopes per keystroke would be the whole cost of a listing;
+  filtering is a pure in-memory narrowing of the cached pass. A row that is not
+  resumable still lists — it exists on disk — but cannot be adopted.
+- **`POST /api/chat/slots/import-kiro-cli`** (`{"sid": …}`) converts the replay
+  log to the bundle `messages` shape via `transcript_rows` (Layer A), reads
+  Layer B byte-exact via the shared `_read_layer_b`, assembles a v2 bundle, and
+  passes it through `_validate_bundle` + `_materialise_validated_bundle` — the
+  **same** path §14.5a describes. There is no second materialiser.
+
+**Copy-never-move (§14.2) holds unchanged.** The browser is strictly read-only;
+every write the adopt performs is the import path's own, under a fresh sid, so
+the browsed kiro-cli session is never the one mutated. The store is
+agent-writable and therefore untrusted input: envelopes past `_ENVELOPE_MAX_BYTES`
+list from `stat` alone, replay logs past `_REPLAY_MAX_BYTES` are refused, every
+read uses `open_regular_nofollow`, and records are walked with `bounded_records`
+so one crafted newline-free line cannot force a whole-file allocation.
+
+**Only `user`/`assistant` text rows cross.** `toolUse` / `ToolResults` frames
+reference local tool state that means nothing once replayed, and
+`user`/`assistant` is exactly the role set a bundle's `messages` may carry
+(§14.1a). The model's real tool history is not lost — it rides in Layer B, which
+travels byte-exact, the same as a peer transfer.
 
 ## 15. Federated session search (search every connected instance at once)
 

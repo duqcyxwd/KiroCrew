@@ -363,48 +363,56 @@ async def api_chat_slot_import(request: web.Request) -> web.Response:
     return response
 
 
+def _slot_cap_refusal(state: DashboardState, caller: str) -> web.Response | None:
+    """The 429 an arrival gets when this instance is already at its slot cap.
+
+    Shared because the cap has to hold for EVERY arrival, and each arrival
+    reaches it at a different moment: a wire bundle is refused before its body
+    is read (a refused arrival must not first stream megabytes to disk), while a
+    local adopt is refused before it converts a replay log. Returning the
+    response rather than raising keeps both call sites a plain early return.
+    """
+    if state.live_slot_count() < MAX_LIVE_SLOTS:
+        return None
+    sel().log_api_access(
+        caller=caller,
+        operation="chat.slot_import",
+        outcome="denied",
+        source="rate_limit",
+        resources=f"slot_count={state.live_slot_count()}",
+        error="slot cap reached",
+    )
+    return web.json_response(
+        {
+            "error": f"slot cap reached ({MAX_LIVE_SLOTS})",
+            "code": "transfer_slot_cap",
+        },
+        status=429,
+    )
+
+
 async def _install_arrived_bundle(
     request: web.Request, keep: contextlib.AsyncExitStack
 ) -> web.Response:
-    """Materialise one arrived bundle. See :func:`api_chat_slot_import`.
+    """Read and validate one bundle that arrived over the WIRE, then install it.
+
+    See :func:`api_chat_slot_import`. What stays here is the part specific to a
+    bundle that came off a socket -- reading the body (gzipped or plain, sniffed
+    from its own bytes) and validating its structure. Everything an arrival does
+    once it HAS a validated bundle is :func:`_materialise_validated_bundle`, so
+    the "one route, one set of rules" property (instances.md section 14.5a) is a
+    property of the code rather than of a convention two callers have to keep.
 
     *keep* holds resources that must live until the arrival is finished rather
-    than until the body has been read — today that is the expansion permit.
+    than until the body has been read -- today that is the expansion permit.
     """
-    # Imported function-locally, not at module level: chat_handlers' import graph
-    # reaches back here (see the layering note at the top of this module), so a
-    # module-level import would close an import cycle.
-    from kiro_crew.dashboard.chat_handlers import _materialise_slot_from_history
-
     state: DashboardState = request.app["state"]
     request_app = request.get("app", "")
     caller = request_app or "dashboard"
-    # The AUTHORIZATION identity, resolved by the shared rule rather than read
-    # off the request the way ``request_app`` above is. The two differ for a
-    # caller that carries no app claim but does carry a session key an app owns:
-    # ``request.get("app")`` is empty there and the shared rule derives the app.
-    # Filing must see the derived value, because that is the caller an
-    # app-scoped arrival has to be refused a folder for. Kept SEPARATE from
-    # ``request_app`` on purpose — that value is the slot's own app attribution
-    # and its meaning is not this one's.
-    folder_app = effective_request_app(state, request)
 
-    if state.live_slot_count() >= MAX_LIVE_SLOTS:
-        sel().log_api_access(
-            caller=caller,
-            operation="chat.slot_import",
-            outcome="denied",
-            source="rate_limit",
-            resources=f"slot_count={state.live_slot_count()}",
-            error="slot cap reached",
-        )
-        return web.json_response(
-            {
-                "error": f"slot cap reached ({MAX_LIVE_SLOTS})",
-                "code": "transfer_slot_cap",
-            },
-            status=429,
-        )
+    cap_refused = _slot_cap_refusal(state, caller)
+    if cap_refused is not None:
+        return cap_refused
 
     body, body_err = await _read_bundle_body(request, keep)
     if body_err is not None:
@@ -426,6 +434,45 @@ async def _install_arrived_bundle(
             error="bundle rejected",
         )
         return err
+
+    return await _materialise_validated_bundle(request, bundle)
+
+
+async def _materialise_validated_bundle(
+    request: web.Request, bundle: dict[str, Any]
+) -> web.Response:
+    """Materialise one ALREADY-VALIDATED bundle as a new slot.
+
+    The whole of what "a session arrived here" means, for every arrival route:
+    the tunnel push, the exported-file install, and a local kiro-cli adopt
+    (:mod:`kiro_crew.dashboard.kiro_cli_adopt`). Callers differ only in where
+    the bundle came FROM and how its bytes were obtained; from here on an
+    arrival is one code path, which is what instances.md section 14.5a asks for.
+
+    *bundle* MUST have been through :func:`_validate_bundle` -- every field is
+    read here as the shape that function guarantees, so an unvalidated document
+    would be trusted structurally.
+
+    Returns the endpoint's own response, including its refusals, so a caller
+    adds nothing but the bundle.
+    """
+    # Imported function-locally, not at module level: chat_handlers' import graph
+    # reaches back here (see the layering note at the top of this module), so a
+    # module-level import would close an import cycle.
+    from kiro_crew.dashboard.chat_handlers import _materialise_slot_from_history
+
+    state: DashboardState = request.app["state"]
+    request_app = request.get("app", "")
+    caller = request_app or "dashboard"
+    # The AUTHORIZATION identity, resolved by the shared rule rather than read
+    # off the request the way ``request_app`` above is. The two differ for a
+    # caller that carries no app claim but does carry a session key an app owns:
+    # ``request.get("app")`` is empty there and the shared rule derives the app.
+    # Filing must see the derived value, because that is the caller an
+    # app-scoped arrival has to be refused a folder for. Kept SEPARATE from
+    # ``request_app`` on purpose -- that value is the slot's own app attribution
+    # and its meaning is not this one's.
+    folder_app = effective_request_app(state, request)
 
     messages = bundle["messages"]
     # Agent resolution scans the agents directory and parses each manifest, so it

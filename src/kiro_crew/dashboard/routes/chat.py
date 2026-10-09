@@ -16,6 +16,7 @@ from kiro_crew.dashboard import (
     chat_follow_default,
     chat_threads,
     handlers,
+    kiro_cli_adopt,
     session_export,
     session_transfer,
 )
@@ -99,6 +100,11 @@ def register(app: web.Application) -> None:
     # precedent: aiohttp resolves in registration order, so a later
     # ``/api/chat/slots/{slot}`` POST would otherwise shadow this path.
     app.router.add_post("/api/chat/slots/import", session_transfer.api_chat_slot_import)
+    # kiro-cli session browser + adopt (the "Import a kiro-cli session" picker).
+    # Static segments — before the {slot} routes below for the same reason as
+    # import/cleanup/model: aiohttp resolves in registration order.
+    app.router.add_get("/api/kiro-cli-sessions", kiro_cli_adopt.api_kiro_cli_sessions)
+    app.router.add_post("/api/chat/slots/import-kiro-cli", kiro_cli_adopt.api_kiro_cli_adopt)
     app.router.add_get("/api/chat/slots/{slot}", chat.api_chat_slot_detail)
     # Download one session as a file. GET because it changes no conversation --
     # a repeat costs the source nothing. It does flush a dirty slot first, like
